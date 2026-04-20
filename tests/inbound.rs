@@ -2,6 +2,8 @@ use std::net::SocketAddr;
 
 use ntest::timeout;
 use regex::Regex;
+use std::time::Duration;
+
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -59,6 +61,8 @@ async fn mock_test_server() -> Result<(JoinHandle<()>, SocketAddr)> {
                             data_string = data_string.replace(&uuid_old, &new_uuids);
                             let reloadxml_app = format!("bgapi reloadxml\nJob-UUID: {}", new_uuids);
                             let some_user_that_doesnt_exists = format!("bgapi originate user/some_user_that_doesnt_exists karan\nJob-UUID: {}",new_uuids);
+                            let never_respond =
+                                format!("bgapi never_respond\nJob-UUID: {}", new_uuids);
 
                             if data_string == reloadxml_app {
                                 let first_1 = "Content-Type: command/reply\nReply-Text: +OK Job-UUID: UUID_PLACEHOLDER\nJob-UUID: UUID_PLACEHOLDER\n\n";
@@ -72,11 +76,20 @@ async fn mock_test_server() -> Result<(JoinHandle<()>, SocketAddr)> {
                                 let first = first_1.replace("UUID_PLACEHOLDER", &uuid_old);
                                 let second = second_1.replace("UUID_PLACEHOLDER", &uuid_old);
                                 vec![first, second]
+                            } else if data_string == never_respond {
+                                let first_1 = "Content-Type: command/reply\nReply-Text: +OK Job-UUID: UUID_PLACEHOLDER\nJob-UUID: UUID_PLACEHOLDER\n\n";
+                                let first = first_1.replace("UUID_PLACEHOLDER", &uuid_old);
+                                vec![first]
                             } else {
                                 panic!("Unhandled application")
                             }
                         } else {
                             // data_string.contains("Job-UUID")
+
+                            if data_string == "api never_respond" {
+                                received_data.drain(0..=index + 1);
+                                continue;
+                            }
 
                             let response_text = match data_string.as_ref() {
                             "auth ClueCon" => {
@@ -96,6 +109,9 @@ async fn mock_test_server() -> Result<(JoinHandle<()>, SocketAddr)> {
                             }
                             "api uuid_kill karan" => {
                                 "Content-Type: api/response\nContent-Length: 4\n\n+OK\n"
+                            }
+                            "bgapi never_respond" => {
+                                "Content-Type: command/reply\nReply-Text: +OK Job-UUID: 14f61274-6487-4b79-b97b-ee0feca07e86\nJob-UUID: 14f61274-6487-4b79-b97b-ee0feca07e86\n\n"
                             }
                             "event json BACKGROUND_JOB CHANNEL_EXECUTE_COMPLETE"=>{
                                 "Content-Type: command/reply\nReply-Text: +OK event listener enabled json\n\n"
@@ -173,6 +189,98 @@ async fn send_recv_test() -> Result<()> {
     let response = inbound.send_recv(b"api reloadxml").await?;
     let body = response.body().clone().unwrap();
     assert_eq!("+OK [Success]\n", body);
+    Ok(())
+}
+
+#[tokio::test]
+#[timeout(10000)]
+async fn send_recv_timeout_marks_connection_closed() -> Result<()> {
+    let (_, addr) = mock_test_server().await?;
+    let stream = TcpStream::connect(addr).await?;
+    let inbound = Esl::inbound(stream, "ClueCon").await?;
+
+    let response = inbound
+        .send_recv_timeout(b"api never_respond", Duration::from_millis(25))
+        .await;
+
+    assert_eq!(Err(EslError::Timeout(Duration::from_millis(25))), response);
+    assert!(!inbound.connected());
+
+    let response = inbound.api("reloadxml").await;
+    assert_eq!(Err(EslError::ConnectionClosed), response);
+    Ok(())
+}
+
+#[tokio::test]
+#[timeout(10000)]
+async fn cancelled_send_recv_timeout_still_fails_connection() -> Result<()> {
+    let (_, addr) = mock_test_server().await?;
+    let stream = TcpStream::connect(addr).await?;
+    let inbound = Esl::inbound(stream, "ClueCon").await?;
+    let task_connection = inbound.clone();
+
+    let handle = tokio::spawn(async move {
+        task_connection
+            .send_recv_timeout(b"api never_respond", Duration::from_millis(25))
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    handle.abort();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    assert!(!inbound.connected());
+    let response = inbound.api("reloadxml").await;
+    assert_eq!(Err(EslError::ConnectionClosed), response);
+    Ok(())
+}
+
+#[tokio::test]
+#[timeout(10000)]
+async fn bgapi_timeout_only_times_out_background_job() -> Result<()> {
+    let (_, addr) = mock_test_server().await?;
+    let stream = TcpStream::connect(addr).await?;
+    let inbound = Esl::inbound(stream, "ClueCon").await?;
+
+    let response = inbound
+        .bgapi_timeout(
+            "never_respond",
+            Duration::from_secs(1),
+            Duration::from_millis(25),
+        )
+        .await;
+
+    assert_eq!(Err(EslError::Timeout(Duration::from_millis(25))), response);
+    assert!(inbound.connected());
+
+    let response = inbound.api("reloadxml").await;
+    assert_eq!(Ok("[Success]".into()), response);
+    Ok(())
+}
+
+#[tokio::test]
+#[timeout(10000)]
+async fn cancelled_bgapi_timeout_still_cleans_background_job() -> Result<()> {
+    let (_, addr) = mock_test_server().await?;
+    let stream = TcpStream::connect(addr).await?;
+    let inbound = Esl::inbound(stream, "ClueCon").await?;
+    let task_connection = inbound.clone();
+
+    let handle = tokio::spawn(async move {
+        task_connection
+            .bgapi_timeout(
+                "never_respond",
+                Duration::from_secs(1),
+                Duration::from_millis(25),
+            )
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    handle.abort();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    assert!(inbound.connected());
+    let response = inbound.api("reloadxml").await;
+    assert_eq!(Ok("[Success]".into()), response);
     Ok(())
 }
 

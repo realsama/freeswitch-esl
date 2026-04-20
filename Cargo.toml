@@ -11,7 +11,7 @@ repository = "https://github.com/KaranGauswami/freeswitch-esl.git"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-tokio = { version = "1", features = ["io-util", "net", "rt"] }
+tokio = { version = "1", features = ["io-util", "net", "rt", "time"] }
 tracing = "0.1"
 bytes = "1.4"
 tokio-util = { version = "0.7", features = ["codec"] }

@@ -16,6 +16,12 @@ pub enum EslError {
     #[error("Unable to connect to destination server.")]
     ConnectionError(String),
 
+    #[error("ESL connection is closed.")]
+    ConnectionClosed,
+
+    #[error("ESL operation timed out after {0:?}.")]
+    Timeout(std::time::Duration),
+
     #[error("{0:?}")]
     ApiError(String),
 
