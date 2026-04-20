@@ -63,6 +63,11 @@ async fn mock_test_server() -> Result<(JoinHandle<()>, SocketAddr)> {
                             let some_user_that_doesnt_exists = format!("bgapi originate user/some_user_that_doesnt_exists karan\nJob-UUID: {}",new_uuids);
                             let never_respond =
                                 format!("bgapi never_respond\nJob-UUID: {}", new_uuids);
+                            let silent = format!("bgapi silent\nJob-UUID: {}", new_uuids);
+                            let cancel_then_complete = format!(
+                                "bgapi cancel_then_complete\nJob-UUID: {}",
+                                new_uuids
+                            );
 
                             if data_string == reloadxml_app {
                                 let first_1 = "Content-Type: command/reply\nReply-Text: +OK Job-UUID: UUID_PLACEHOLDER\nJob-UUID: UUID_PLACEHOLDER\n\n";
@@ -80,6 +85,31 @@ async fn mock_test_server() -> Result<(JoinHandle<()>, SocketAddr)> {
                                 let first_1 = "Content-Type: command/reply\nReply-Text: +OK Job-UUID: UUID_PLACEHOLDER\nJob-UUID: UUID_PLACEHOLDER\n\n";
                                 let first = first_1.replace("UUID_PLACEHOLDER", &uuid_old);
                                 vec![first]
+                            } else if data_string == silent {
+                                // Drain without responding — simulates a bgapi
+                                // where the command/reply frame never arrives.
+                                vec![]
+                            } else if data_string == cancel_then_complete {
+                                // Command-reply lands immediately so the
+                                // client's bgapi() progresses to awaiting the
+                                // BACKGROUND_JOB. The delay lets the test
+                                // abort the bgapi future before the second
+                                // frame arrives, exercising the reader's
+                                // dropped-waiter branch.
+                                let first_1 = "Content-Type: command/reply\nReply-Text: +OK Job-UUID: UUID_PLACEHOLDER\nJob-UUID: UUID_PLACEHOLDER\n\n";
+                                let second_1 = "Content-Length: 615\nContent-Type: text/event-json\n\n{\"Event-Name\":\"BACKGROUND_JOB\",\"Core-UUID\":\"bd0e8916-6a60-4e11-8978-db8580b440a6\",\"FreeSWITCH-Hostname\":\"ip-172-31-32-63\",\"FreeSWITCH-Switchname\":\"ip-172-31-32-63\",\"FreeSWITCH-IPv4\":\"172.31.32.63\",\"FreeSWITCH-IPv6\":\"::1\",\"Event-Date-Local\":\"2023-09-12 04:31:37\",\"Event-Date-GMT\":\"Tue, 12 Sep 2023 04:31:37 GMT\",\"Event-Date-Timestamp\":\"1694493097638660\",\"Event-Calling-File\":\"mod_event_socket.c\",\"Event-Calling-Function\":\"api_exec\",\"Event-Calling-Line-Number\":\"1572\",\"Event-Sequence\":\"18546\",\"Job-UUID\":\"UUID_PLACEHOLDER\",\"Job-Command\":\"reloadxml\",\"Content-Length\":\"14\",\"_body\":\"+OK [Success]\\n\"}";
+                                let first =
+                                    first_1.replace("UUID_PLACEHOLDER", &uuid_old);
+                                let second =
+                                    second_1.replace("UUID_PLACEHOLDER", &uuid_old);
+                                if socket.write_all(first.as_bytes()).await.is_err() {
+                                    break;
+                                }
+                                tokio::time::sleep(Duration::from_millis(60)).await;
+                                if socket.write_all(second.as_bytes()).await.is_err() {
+                                    break;
+                                }
+                                vec![]
                             } else {
                                 panic!("Unhandled application")
                             }
@@ -87,6 +117,32 @@ async fn mock_test_server() -> Result<(JoinHandle<()>, SocketAddr)> {
                             // data_string.contains("Job-UUID")
 
                             if data_string == "api never_respond" {
+                                received_data.drain(0..=index + 1);
+                                continue;
+                            }
+
+                            if data_string == "api disconnect_me" {
+                                // Return from the per-connection task so the
+                                // socket drops and the client's reader sees
+                                // EOF.
+                                return;
+                            }
+
+                            if data_string == "api trigger_malformed" {
+                                // Emit a malformed text/event-json body followed
+                                // by a real api/response. The reader must warn
+                                // and continue, not panic, or the api() call
+                                // below it will never receive its reply.
+                                let malformed =
+                                    "Content-Length: 10\nContent-Type: text/event-json\n\nnot-json!!";
+                                let reply =
+                                    "Content-Type: api/response\nContent-Length: 14\n\n+OK [Success]\n\n";
+                                if socket.write_all(malformed.as_bytes()).await.is_err() {
+                                    break;
+                                }
+                                if socket.write_all(reply.as_bytes()).await.is_err() {
+                                    break;
+                                }
                                 received_data.drain(0..=index + 1);
                                 continue;
                             }
@@ -213,6 +269,25 @@ async fn send_recv_timeout_marks_connection_closed() -> Result<()> {
 
 #[tokio::test]
 #[timeout(10000)]
+async fn api_timeout_marks_connection_closed_on_elapse() -> Result<()> {
+    let (_, addr) = mock_test_server().await?;
+    let stream = TcpStream::connect(addr).await?;
+    let inbound = Esl::inbound(stream, "ClueCon").await?;
+
+    let response = inbound
+        .api_timeout("never_respond", Duration::from_millis(25))
+        .await;
+
+    assert_eq!(Err(EslError::Timeout(Duration::from_millis(25))), response);
+    assert!(!inbound.connected());
+
+    let response = inbound.api("reloadxml").await;
+    assert_eq!(Err(EslError::ConnectionClosed), response);
+    Ok(())
+}
+
+#[tokio::test]
+#[timeout(10000)]
 async fn cancelled_send_recv_timeout_still_fails_connection() -> Result<()> {
     let (_, addr) = mock_test_server().await?;
     let stream = TcpStream::connect(addr).await?;
@@ -229,6 +304,29 @@ async fn cancelled_send_recv_timeout_still_fails_connection() -> Result<()> {
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     assert!(!inbound.connected());
+    let response = inbound.api("reloadxml").await;
+    assert_eq!(Err(EslError::ConnectionClosed), response);
+    Ok(())
+}
+
+#[tokio::test]
+#[timeout(10000)]
+async fn bgapi_timeout_reply_timeout_elapse_marks_connection_failed() -> Result<()> {
+    let (_, addr) = mock_test_server().await?;
+    let stream = TcpStream::connect(addr).await?;
+    let inbound = Esl::inbound(stream, "ClueCon").await?;
+
+    let response = inbound
+        .bgapi_timeout(
+            "silent",
+            Duration::from_millis(25),
+            Duration::from_secs(1),
+        )
+        .await;
+
+    assert_eq!(Err(EslError::Timeout(Duration::from_millis(25))), response);
+    assert!(!inbound.connected());
+
     let response = inbound.api("reloadxml").await;
     assert_eq!(Err(EslError::ConnectionClosed), response);
     Ok(())
@@ -281,6 +379,77 @@ async fn cancelled_bgapi_timeout_still_cleans_background_job() -> Result<()> {
     assert!(inbound.connected());
     let response = inbound.api("reloadxml").await;
     assert_eq!(Ok("[Success]".into()), response);
+    Ok(())
+}
+
+#[tokio::test]
+#[timeout(5000)]
+async fn reader_survives_dropped_bgapi_waiter() -> Result<()> {
+    let (_, addr) = mock_test_server().await?;
+    let stream = TcpStream::connect(addr).await?;
+    let inbound = Esl::inbound(stream, "ClueCon").await?;
+
+    let task_conn = inbound.clone();
+    let handle =
+        tokio::spawn(async move { task_conn.bgapi("cancel_then_complete").await });
+    // Let the command-reply land so the bgapi future is awaiting the
+    // BACKGROUND_JOB, then abort. rx is dropped; tx stays in the map.
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    handle.abort();
+    // Let the server emit the BACKGROUND_JOB targeting the dropped waiter.
+    tokio::time::sleep(Duration::from_millis(120)).await;
+
+    // Reader must still be alive — a subsequent api call still works.
+    let response = inbound.api("reloadxml").await;
+    assert_eq!(Ok("[Success]".into()), response);
+    assert!(inbound.connected());
+    Ok(())
+}
+
+#[tokio::test]
+#[timeout(5000)]
+async fn reader_exit_clears_pending_waiters() -> Result<()> {
+    let (_, addr) = mock_test_server().await?;
+    let stream = TcpStream::connect(addr).await?;
+    let inbound = Esl::inbound(stream, "ClueCon").await?;
+
+    // Pending bgapi: server sends the command-reply but never emits
+    // BACKGROUND_JOB, so this blocks in the background_jobs map.
+    let bgapi_conn = inbound.clone();
+    let bgapi_handle =
+        tokio::spawn(async move { bgapi_conn.bgapi("never_respond").await });
+    // Pending command: server drains without replying, so this blocks in
+    // the commands FIFO.
+    let api_conn = inbound.clone();
+    let api_handle =
+        tokio::spawn(async move { api_conn.send_recv(b"api never_respond").await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Trigger server-side disconnect. Reader sees EOF and must clear every
+    // pending waiter, not just the one it happens to be holding.
+    let _ = inbound.send_recv(b"api disconnect_me").await;
+
+    let bgapi_result = bgapi_handle.await.unwrap();
+    let api_result = api_handle.await.unwrap();
+    assert!(matches!(bgapi_result, Err(EslError::ConnectionClosed)));
+    assert!(matches!(api_result, Err(EslError::ConnectionClosed)));
+    assert!(!inbound.connected());
+    Ok(())
+}
+
+#[tokio::test]
+#[timeout(5000)]
+async fn reader_survives_malformed_event_json_body() -> Result<()> {
+    let (_, addr) = mock_test_server().await?;
+    let stream = TcpStream::connect(addr).await?;
+    let inbound = Esl::inbound(stream, "ClueCon").await?;
+
+    let response = inbound.api("trigger_malformed").await;
+    assert_eq!(Ok("[Success]".into()), response);
+
+    let response = inbound.api("reloadxml").await;
+    assert_eq!(Ok("[Success]".into()), response);
+    assert!(inbound.connected());
     Ok(())
 }
 
