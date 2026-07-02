@@ -7,7 +7,7 @@ use thiserror::Error;
 #[allow(missing_docs)]
 /// Error type for Esl
 pub enum EslError {
-    #[error("unknown error")]
+    #[error("internal error: {0}")]
     InternalError(String),
 
     #[error("Wrong password.")]
@@ -50,5 +50,19 @@ impl From<serde_json::Error> for EslError {
 impl From<ParseIntError> for EslError {
     fn from(error: ParseIntError) -> Self {
         Self::InternalError(error.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::EslError;
+
+    #[test]
+    fn internal_error_display_carries_the_detail() {
+        let err = EslError::InternalError("Unable to find space index".into());
+        assert!(
+            err.to_string().contains("Unable to find space index"),
+            "InternalError must not mask its detail; got: {err}"
+        );
     }
 }
