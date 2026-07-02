@@ -1,6 +1,6 @@
 #![warn(missing_docs)]
 
-use crate::code::{Code, ParseCode};
+use crate::code::Code;
 use crate::error::EslError;
 use crate::esl::EslConnectionType;
 use crate::event::Event;
@@ -604,21 +604,93 @@ fn parse_bgapi_response(resp: Event) -> Result<String, EslError> {
         Code::Unknown => Ok(body.to_string()),
     }
 }
+/// Splits an api/response or Reply-Text body into its result code and text.
+///
+/// Only bodies starting with `+OK` or `-ERR` carry a code. Value-returning
+/// api commands (uuid_getvar, global_getvar, eval, expand, …) reply with the
+/// raw value only — possibly empty, possibly without any whitespace — so
+/// anything else is `Code::Unknown` with the body passed through verbatim.
 fn parse_api_response(body: &str) -> Result<(Code, String), EslError> {
-    let space_index = body
-        .find(char::is_whitespace)
-        .ok_or_else(|| EslError::InternalError("Unable to find space index".into()))?;
-    let code = &body[..space_index];
-    let text_start = space_index + 1;
-    let body_length = body.len();
-    let text = if text_start < body_length {
-        body[text_start..(body_length - 1)].to_string()
-    } else {
-        String::new()
-    };
-    let code = code.parse_code()?;
-    Ok((code, text))
+    let trimmed = body.strip_suffix('\n').unwrap_or(body);
+    for (token, code) in [("+OK", Code::Ok), ("-ERR", Code::Err)] {
+        if let Some(rest) = trimmed.strip_prefix(token) {
+            if rest.is_empty() {
+                return Ok((code, String::new()));
+            }
+            if let Some(text) = rest.strip_prefix(' ') {
+                return Ok((code, text.to_string()));
+            }
+        }
+    }
+    Ok((Code::Unknown, trimmed.to_string()))
 }
 fn parse_json_body(body: &str) -> Result<HashMap<String, Value>, EslError> {
     Ok(serde_json::from_str(body)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Value-returning api commands (uuid_getvar, global_getvar, eval, expand)
+    // reply with the raw value and no +OK/-ERR prefix and no trailing newline:
+    // mod_commands.c writes `stream->write_function(stream, "%s", value)`.
+
+    #[test]
+    fn bare_value_body_parses_as_unknown() {
+        let (code, text) = parse_api_response("1").unwrap();
+        assert_eq!(code, Code::Unknown);
+        assert_eq!(text, "1");
+    }
+
+    #[test]
+    fn undef_body_parses_as_unknown() {
+        let (code, text) = parse_api_response("_undef_").unwrap();
+        assert_eq!(code, Code::Unknown);
+        assert_eq!(text, "_undef_");
+    }
+
+    #[test]
+    fn empty_body_parses_as_unknown() {
+        let (code, text) = parse_api_response("").unwrap();
+        assert_eq!(code, Code::Unknown);
+        assert_eq!(text, "");
+    }
+
+    #[test]
+    fn ok_with_text_and_trailing_newline() {
+        let (code, text) = parse_api_response("+OK done\n").unwrap();
+        assert_eq!(code, Code::Ok);
+        assert_eq!(text, "done");
+    }
+
+    #[test]
+    fn ok_with_text_without_trailing_newline() {
+        // command/reply Reply-Text carries no trailing newline; the text must
+        // not lose its last character.
+        let (code, text) = parse_api_response("+OK accepted").unwrap();
+        assert_eq!(code, Code::Ok);
+        assert_eq!(text, "accepted");
+    }
+
+    #[test]
+    fn bare_ok_without_text() {
+        let (code, text) = parse_api_response("+OK").unwrap();
+        assert_eq!(code, Code::Ok);
+        assert_eq!(text, "");
+    }
+
+    #[test]
+    fn err_with_reason() {
+        let (code, text) = parse_api_response("-ERR No such channel!\n").unwrap();
+        assert_eq!(code, Code::Err);
+        assert_eq!(text, "No such channel!");
+    }
+
+    #[test]
+    fn value_sharing_an_ok_prefix_is_not_an_ok_reply() {
+        let (code, text) = parse_api_response("+OKAY-ish value").unwrap();
+        assert_eq!(code, Code::Unknown);
+        assert_eq!(text, "+OKAY-ish value");
+    }
 }
